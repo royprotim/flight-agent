@@ -624,9 +624,9 @@ func mapDuffelOffer(offer duffelOffer) (FlightOffer, error) {
 		for index := 0; index+1 < len(slice.Segments); index++ {
 			connection := slice.Segments[index]
 			next := slice.Segments[index+1]
-			airport := connection.ArrivingAirport.IATACode
+			airport := segmentDestinationCode(connection)
 			if airport == "" {
-				airport = next.DepartingAirport.IATACode
+				airport = segmentOriginCode(next)
 			}
 			if airport != "" {
 				mapped.ConnectionAirports = append(mapped.ConnectionAirports, airport)
@@ -635,15 +635,30 @@ func mapDuffelOffer(offer duffelOffer) (FlightOffer, error) {
 				}
 			}
 			if index == 0 {
-				arrivedAt, arrivalErr := time.Parse(time.RFC3339, connection.ArrivingAt)
-				departedAt, departureErr := time.Parse(time.RFC3339, next.DepartingAt)
-				if arrivalErr == nil && departureErr == nil {
-					mapped.LayoverHours = departedAt.Sub(arrivedAt).Hours()
-				}
+				mapped.LayoverHours = layoverHoursBetween(connection.ArrivingAt, next.DepartingAt)
 			}
 		}
 	}
 	return mapped, nil
+}
+
+func layoverHoursBetween(arrival, departure string) float64 {
+	arrivedAt, arrivalErr := parseDuffelTime(arrival)
+	departedAt, departureErr := parseDuffelTime(departure)
+	if arrivalErr != nil || departureErr != nil || !departedAt.After(arrivedAt) {
+		return 0
+	}
+	return departedAt.Sub(arrivedAt).Hours()
+}
+
+func parseDuffelTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05-07:00"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported Duffel time %q", value)
 }
 
 func convertToINR(amount float64, currency string) (float64, error) {

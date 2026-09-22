@@ -95,6 +95,35 @@ func TestMapDuffelOfferUsesOriginAndDestinationFields(t *testing.T) {
 	}
 }
 
+func TestMapDuffelOfferIncludesConnectingAirportFromSegmentPlaces(t *testing.T) {
+	offer := duffelOffer{ID: "offer_connection", TotalAmount: "100", TotalCurrency: "INR", Slices: []duffelSlice{{Segments: []duffelSegment{
+		{Origin: struct {
+			IATACode string `json:"iata_code"`
+		}{IATACode: "DEL"}, Destination: struct {
+			IATACode string `json:"iata_code"`
+		}{IATACode: "CCU"}},
+		{Origin: struct {
+			IATACode string `json:"iata_code"`
+		}{IATACode: "CCU"}, Destination: struct {
+			IATACode string `json:"iata_code"`
+		}{IATACode: "IXZ"}},
+	}}}}
+	mapped, err := mapDuffelOffer(offer)
+	if err != nil {
+		t.Fatalf("mapDuffelOffer returned error: %v", err)
+	}
+	if mapped.ConnectionAirport != "CCU" || len(mapped.ConnectionAirports) != 1 || mapped.ConnectionAirports[0] != "CCU" {
+		t.Fatalf("connections = %q / %v, want CCU", mapped.ConnectionAirport, mapped.ConnectionAirports)
+	}
+}
+
+func TestLayoverHoursBetweenParsesDuffelTimes(t *testing.T) {
+	hours := layoverHoursBetween("2026-12-19T08:00:00+00:00", "2026-12-19T12:30:00+00:00")
+	if hours != 4.5 {
+		t.Fatalf("layover hours = %.2f, want 4.5", hours)
+	}
+}
+
 func TestMapDuffelOfferRejectsInvalidOffer(t *testing.T) {
 	_, err := mapDuffelOffer(duffelOffer{ID: "off_empty", TotalAmount: "10", TotalCurrency: "INR"})
 	if err == nil || !strings.Contains(err.Error(), "no segments") {
