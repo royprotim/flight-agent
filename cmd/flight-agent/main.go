@@ -9,7 +9,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -28,20 +30,104 @@ type FlightSearchParams struct {
 	DepartureDate string `json:"departure_date"`
 	Passengers    int    `json:"passengers"`
 	CabinClass    string `json:"cabin_class"`
+	Preference    string `json:"preference,omitempty"`
+}
+
+func flightSearchSchema() *genai.Schema {
+	return &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"origin":         {Type: genai.TypeString},
+			"destination":    {Type: genai.TypeString},
+			"departure_date": {Type: genai.TypeString},
+			"passengers":     {Type: genai.TypeInteger},
+			"cabin_class":    {Type: genai.TypeString, Enum: []string{"ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"}},
+			"preference":     {Type: genai.TypeString},
+		},
+		Required: []string{"origin", "destination", "departure_date", "passengers", "cabin_class"},
+	}
+}
+
+func extractFlightSearchParams(ctx context.Context, client *genai.Client, query string) (FlightSearchParams, error) {
+	if client == nil {
+		return FlightSearchParams{}, fmt.Errorf("GEMINI_API_KEY is required for natural-language searches")
+	}
+	response, err := client.Models.GenerateContent(ctx, modelName(), []*genai.Content{
+		genai.NewContentFromText("Extract the flight search details from this request. Keep any extra constraints in preference. Request: "+query, genai.RoleUser),
+	}, &genai.GenerateContentConfig{
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   flightSearchSchema(),
+	})
+	if err != nil {
+		return FlightSearchParams{}, fmt.Errorf("extract flight query: %w", err)
+	}
+	var params FlightSearchParams
+	if err := json.Unmarshal([]byte(response.Text()), &params); err != nil {
+		return FlightSearchParams{}, fmt.Errorf("decode extracted flight query: %w", err)
+	}
+	return params, nil
+}
+
+// BuildFlightQuery combines structured trip details with the user's
+// free-form preference into the canonical search intent.
+func BuildFlightQuery(params FlightSearchParams) string {
+	query := fmt.Sprintf("Find a %s flight for %d passenger(s) from %s to %s on %s.",
+		strings.ToLower(params.CabinClass),
+		params.Passengers,
+		strings.ToUpper(strings.TrimSpace(params.Origin)),
+		strings.ToUpper(strings.TrimSpace(params.Destination)),
+		strings.TrimSpace(params.DepartureDate),
+	)
+	if preference := strings.TrimSpace(params.Preference); preference != "" {
+		query += " User preference: " + preference
+	}
+	return query
 }
 
 // FlightOffer represents a flight option returned by the provider API.
 type FlightOffer struct {
-	ID        string  `json:"id"`
-	Airline   string  `json:"airline"`
-	FlightNum string  `json:"flight_number"`
-	Origin    string  `json:"origin"`
-	Dest      string  `json:"destination"`
-	DepTime   string  `json:"departure_time"`
-	ArrTime   string  `json:"arrival_time"`
-	Duration  string  `json:"duration"`
-	PriceINR  float64 `json:"price_inr"`
-	Stops     int     `json:"stops"`
+	ID                 string        `json:"id"`
+	Airline            string        `json:"airline"`
+	FlightNum          string        `json:"flight_number"`
+	Origin             string        `json:"origin"`
+	Dest               string        `json:"destination"`
+	DepTime            string        `json:"departure_time"`
+	ArrTime            string        `json:"arrival_time"`
+	Duration           string        `json:"duration"`
+	PriceINR           float64       `json:"price_inr"`
+	Stops              int           `json:"stops"`
+	ConnectionAirport  string        `json:"connection_airport,omitempty"`
+	ConnectionAirports []string      `json:"connection_airports,omitempty"`
+	LayoverHours       float64       `json:"layover_hours,omitempty"`
+	Recommended        bool          `json:"recommended"`
+	PreferenceReasons  []string      `json:"preference_reasons,omitempty"`
+	Rating             *FlightRating `json:"rating,omitempty"`
+}
+
+type FlightRating struct {
+	Overall              int      `json:"overall"`
+	PriceSensitivity     int      `json:"price_sensitivity"`
+	Delay                int      `json:"delay"`
+	Reliability          int      `json:"reliability"`
+	ReliabilityAvailable bool     `json:"reliability_available"`
+	Reasons              []string `json:"reasons,omitempty"`
+}
+
+type LayoverExplanation struct {
+	Title               string  `json:"title"`
+	RequestedHours      float64 `json:"requested_hours"`
+	Airport             string  `json:"airport"`
+	Reason              string  `json:"reason"`
+	InboundDescription  string  `json:"inbound_description,omitempty"`
+	OutboundDescription string  `json:"outbound_description,omitempty"`
+}
+
+type layoverNoMatchError struct {
+	explanation LayoverExplanation
+}
+
+func (e *layoverNoMatchError) Error() string {
+	return e.explanation.Reason
 }
 
 // -------------------------------------------------------------------
@@ -53,9 +139,10 @@ type duffelOfferRequest struct {
 }
 
 type duffelOfferRequestData struct {
-	Slices     []duffelSliceRequest `json:"slices"`
-	Passengers []duffelPassenger    `json:"passengers"`
-	CabinClass string               `json:"cabin_class"`
+	Slices         []duffelSliceRequest `json:"slices"`
+	Passengers     []duffelPassenger    `json:"passengers"`
+	CabinClass     string               `json:"cabin_class"`
+	MaxConnections int                  `json:"max_connections,omitempty"`
 }
 
 type duffelSliceRequest struct {
@@ -75,6 +162,15 @@ type duffelOfferResponse struct {
 	Errors []struct {
 		Message string `json:"message"`
 	} `json:"errors"`
+}
+
+type duffelPlaceSuggestionsResponse struct {
+	Data []struct {
+		Type     string `json:"type"`
+		IATACode string `json:"iata_code"`
+		Name     string `json:"name"`
+		CityName string `json:"city_name"`
+	} `json:"data"`
 }
 
 type duffelOffer struct {
@@ -105,6 +201,26 @@ type duffelSegment struct {
 	ArrivingAirport struct {
 		IATACode string `json:"iata_code"`
 	} `json:"arriving_airport"`
+	Origin struct {
+		IATACode string `json:"iata_code"`
+	} `json:"origin"`
+	Destination struct {
+		IATACode string `json:"iata_code"`
+	} `json:"destination"`
+}
+
+func segmentOriginCode(segment duffelSegment) string {
+	if segment.Origin.IATACode != "" {
+		return segment.Origin.IATACode
+	}
+	return segment.DepartingAirport.IATACode
+}
+
+func segmentDestinationCode(segment duffelSegment) string {
+	if segment.Destination.IATACode != "" {
+		return segment.Destination.IATACode
+	}
+	return segment.ArrivingAirport.IATACode
 }
 
 // SearchFlights creates a Duffel offer request and maps its offers to the
@@ -120,16 +236,32 @@ func SearchFlights(ctx context.Context, params FlightSearchParams) ([]FlightOffe
 	if params.Passengers < 1 {
 		return nil, fmt.Errorf("passengers must be at least 1")
 	}
+	origin, err := resolveAirportCode(ctx, token, params.Origin)
+	if err != nil {
+		return nil, err
+	}
+	destination, err := resolveAirportCode(ctx, token, params.Destination)
+	if err != nil {
+		return nil, err
+	}
 
 	requestBody := duffelOfferRequest{Data: duffelOfferRequestData{
 		Slices: []duffelSliceRequest{{
-			Origin:        strings.ToUpper(params.Origin),
-			Destination:   strings.ToUpper(params.Destination),
+			Origin:        origin,
+			Destination:   destination,
 			DepartureDate: params.DepartureDate,
 		}},
 		Passengers: makePassengers(params.Passengers),
 		CabinClass: strings.ToLower(params.CabinClass),
 	}}
+	layover, hasLayover := parseLayoverPreference(params.Preference)
+	if hasLayover {
+		viaOffers, err := searchViaAirport(ctx, token, origin, destination, layover, params)
+		if err != nil {
+			return nil, err
+		}
+		return mapDuffelOffers(viaOffers)
+	}
 	body, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("encode Duffel request: %w", err)
@@ -166,6 +298,17 @@ func SearchFlights(ctx context.Context, params FlightSearchParams) ([]FlightOffe
 	if len(result.Data.Offers) == 0 {
 		return nil, fmt.Errorf("Duffel returned no flight offers")
 	}
+	if hasLayover {
+		allOffers := result.Data.Offers
+		matchingOffers := filterLayoverOffers(allOffers, layover)
+		if len(matchingOffers) == 0 {
+			matchingOffers = filterOffersViaAirport(allOffers, layover.airport)
+		}
+		result.Data.Offers = matchingOffers
+		if len(result.Data.Offers) == 0 {
+			return nil, &layoverNoMatchError{explanation: buildLayoverExplanation(allOffers, layover, origin, destination)}
+		}
+	}
 
 	offers := make([]FlightOffer, 0, len(result.Data.Offers))
 	for _, offer := range result.Data.Offers {
@@ -179,6 +322,263 @@ func SearchFlights(ctx context.Context, params FlightSearchParams) ([]FlightOffe
 		return nil, fmt.Errorf("Duffel returned offers with no usable flight segments")
 	}
 	return offers, nil
+}
+
+func searchViaAirport(ctx context.Context, token, origin, destination string, preference layoverPreference, params FlightSearchParams) ([]duffelOffer, error) {
+	inbound, err := fetchDuffelOffers(ctx, token, duffelOfferRequest{Data: duffelOfferRequestData{
+		Slices:     []duffelSliceRequest{{Origin: origin, Destination: preference.airport, DepartureDate: params.DepartureDate}},
+		Passengers: makePassengers(params.Passengers), CabinClass: strings.ToLower(params.CabinClass), MaxConnections: 0,
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("search inbound leg to %s: %w", preference.airport, err)
+	}
+	outbound, err := fetchDuffelOffers(ctx, token, duffelOfferRequest{Data: duffelOfferRequestData{
+		Slices:     []duffelSliceRequest{{Origin: preference.airport, Destination: destination, DepartureDate: params.DepartureDate}},
+		Passengers: makePassengers(params.Passengers), CabinClass: strings.ToLower(params.CabinClass), MaxConnections: 0,
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("search outbound leg from %s: %w", preference.airport, err)
+	}
+
+	combined := make([]duffelOffer, 0)
+	for _, first := range inbound {
+		for _, second := range outbound {
+			if len(first.Slices) == 0 || len(second.Slices) == 0 || len(first.Slices[0].Segments) == 0 || len(second.Slices[0].Segments) == 0 {
+				continue
+			}
+			firstSegment := first.Slices[0].Segments[len(first.Slices[0].Segments)-1]
+			secondSegment := second.Slices[0].Segments[0]
+			arrivedAt, firstErr := time.Parse(time.RFC3339, firstSegment.ArrivingAt)
+			departedAt, secondErr := time.Parse(time.RFC3339, secondSegment.DepartingAt)
+			if firstErr != nil || secondErr != nil || !departedAt.After(arrivedAt) {
+				continue
+			}
+			layoverHours := departedAt.Sub(arrivedAt).Hours()
+			if preference.hours > 0 && (layoverHours < preference.hours-0.5 || layoverHours > preference.hours+0.5) {
+				continue
+			}
+			amount, firstErr := strconv.ParseFloat(first.TotalAmount, 64)
+			secondAmount, secondErr := strconv.ParseFloat(second.TotalAmount, 64)
+			if firstErr != nil || secondErr != nil || first.TotalCurrency != second.TotalCurrency {
+				continue
+			}
+			segments := append([]duffelSegment{}, first.Slices[0].Segments...)
+			segments = append(segments, second.Slices[0].Segments...)
+			combined = append(combined, duffelOffer{
+				ID:          "combined_" + first.ID + "_" + second.ID,
+				TotalAmount: strconv.FormatFloat(amount+secondAmount, 'f', 2, 64), TotalCurrency: first.TotalCurrency,
+				Slices: []duffelSlice{{Duration: first.Slices[0].Duration + " + " + second.Slices[0].Duration, Segments: segments}},
+			})
+		}
+	}
+	if len(combined) == 0 {
+		return nil, &layoverNoMatchError{explanation: buildLayoverExplanation(nil, preference, origin, destination)}
+	}
+	return combined, nil
+}
+
+func fetchDuffelOffers(ctx context.Context, token string, requestBody duffelOfferRequest) ([]duffelOffer, error) {
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("encode Duffel request: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.duffel.com/air/offer_requests?return_offers=true&supplier_timeout=20000", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create Duffel request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Duffel-Version", "v2")
+	response, err := (&http.Client{Timeout: 70 * time.Second}).Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("call Duffel API: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("Duffel API returned %s: %s", response.Status, compactResponse(responseBody))
+	}
+	var result duffelOfferResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return nil, fmt.Errorf("decode Duffel response: %w", err)
+	}
+	return result.Data.Offers, nil
+}
+
+func mapDuffelOffers(rawOffers []duffelOffer) ([]FlightOffer, error) {
+	offers := make([]FlightOffer, 0, len(rawOffers))
+	for _, raw := range rawOffers {
+		mapped, err := mapDuffelOffer(raw)
+		if err == nil {
+			offers = append(offers, mapped)
+		}
+	}
+	if len(offers) == 0 {
+		return nil, fmt.Errorf("Duffel returned no usable flight offers")
+	}
+	return offers, nil
+}
+
+func buildLayoverExplanation(offers []duffelOffer, preference layoverPreference, origin, destination string) LayoverExplanation {
+	title := fmt.Sprintf("No flight combinations include a connection in %s", preference.airport)
+	reason := fmt.Sprintf("No returned itinerary from %s to %s includes a connection in %s.", origin, destination, preference.airport)
+	if preference.hours > 0 {
+		title = fmt.Sprintf("No flight combinations match a %.0f-hour layover in %s", preference.hours, preference.airport)
+		reason = fmt.Sprintf("No returned itinerary from %s to %s includes a connection in %s within the requested layover window.", origin, destination, preference.airport)
+	}
+	explanation := LayoverExplanation{
+		Title:          title,
+		RequestedHours: preference.hours,
+		Airport:        preference.airport,
+		Reason:         reason,
+	}
+	var latestArrival, earliestDeparture time.Time
+	var latestArrivalText, earliestDepartureText string
+	for _, offer := range offers {
+		for _, slice := range offer.Slices {
+			for index, segment := range slice.Segments {
+				if index+1 < len(slice.Segments) && segment.ArrivingAirport.IATACode == preference.airport {
+					if value, err := time.Parse(time.RFC3339, segment.ArrivingAt); err == nil && (latestArrival.IsZero() || value.After(latestArrival)) {
+						latestArrival, latestArrivalText = value, segment.ArrivingAt
+					}
+				}
+				if index > 0 && segment.DepartingAirport.IATACode == preference.airport {
+					if value, err := time.Parse(time.RFC3339, segment.DepartingAt); err == nil && (earliestDeparture.IsZero() || value.Before(earliestDeparture)) {
+						earliestDeparture, earliestDepartureText = value, segment.DepartingAt
+					}
+				}
+			}
+		}
+	}
+	if latestArrivalText != "" {
+		explanation.InboundDescription = fmt.Sprintf("Latest observed arrival into %s: %s.", preference.airport, latestArrivalText)
+	}
+	if earliestDepartureText != "" {
+		explanation.OutboundDescription = fmt.Sprintf("Earliest observed departure from %s: %s.", preference.airport, earliestDepartureText)
+	}
+	return explanation
+}
+
+type layoverPreference struct {
+	airport string
+	hours   float64
+}
+
+func parseLayoverPreference(preference string) (layoverPreference, bool) {
+	preferenceLower := strings.ToLower(preference)
+	if !strings.Contains(preferenceLower, "layover") && !strings.Contains(preferenceLower, "stopover") {
+		return layoverPreference{}, false
+	}
+	match := regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)`).FindStringSubmatch(preference)
+	hours := 0.0
+	if len(match) == 2 {
+		parsedHours, err := strconv.ParseFloat(match[1], 64)
+		if err == nil && parsedHours > 0 {
+			hours = parsedHours
+		}
+	}
+	airport := ""
+	for _, candidate := range []struct{ name, code string }{{"kolkata", "CCU"}, {"calcutta", "CCU"}, {"delhi", "DEL"}, {"mumbai", "BOM"}, {"bangalore", "BLR"}, {"bengaluru", "BLR"}, {"chennai", "MAA"}, {"hyderabad", "HYD"}} {
+		if strings.Contains(preferenceLower, candidate.name) {
+			airport = candidate.code
+			break
+		}
+	}
+	if airport == "" {
+		return layoverPreference{}, false
+	}
+	return layoverPreference{airport: airport, hours: hours}, true
+}
+
+func filterLayoverOffers(offers []duffelOffer, preference layoverPreference) []duffelOffer {
+	if preference.hours == 0 {
+		return filterOffersViaAirport(offers, preference.airport)
+	}
+	filtered := make([]duffelOffer, 0, len(offers))
+	for _, offer := range offers {
+		for _, slice := range offer.Slices {
+			for index := 0; index+1 < len(slice.Segments); index++ {
+				arriving := slice.Segments[index]
+				departing := slice.Segments[index+1]
+				if arriving.ArrivingAirport.IATACode != preference.airport && departing.DepartingAirport.IATACode != preference.airport {
+					continue
+				}
+				arrivedAt, err := time.Parse(time.RFC3339, arriving.ArrivingAt)
+				if err != nil {
+					continue
+				}
+				departsAt, err := time.Parse(time.RFC3339, departing.DepartingAt)
+				if err != nil {
+					continue
+				}
+				actualHours := departsAt.Sub(arrivedAt).Hours()
+				if actualHours >= preference.hours-0.5 && actualHours <= preference.hours+0.5 {
+					filtered = append(filtered, offer)
+				}
+			}
+		}
+	}
+	return filtered
+}
+
+func filterOffersViaAirport(offers []duffelOffer, airport string) []duffelOffer {
+	filtered := make([]duffelOffer, 0, len(offers))
+	for _, offer := range offers {
+		for _, slice := range offer.Slices {
+			for index := 0; index+1 < len(slice.Segments); index++ {
+				if slice.Segments[index].ArrivingAirport.IATACode == airport || slice.Segments[index+1].DepartingAirport.IATACode == airport {
+					filtered = append(filtered, offer)
+					break
+				}
+			}
+		}
+	}
+	return filtered
+}
+
+func resolveAirportCode(ctx context.Context, token, value string) (string, error) {
+	cleaned := strings.ToUpper(strings.TrimSpace(value))
+	if len(cleaned) == 3 && cleaned >= "AAA" && cleaned <= "ZZZ" {
+		return cleaned, nil
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("airport or city is required")
+	}
+
+	endpoint := "https://api.duffel.com/places/suggestions?query=" + url.QueryEscape(strings.TrimSpace(value))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("create Duffel place lookup: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Duffel-Version", "v2")
+	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(request)
+	if err != nil {
+		return "", fmt.Errorf("lookup %q with Duffel: %w", value, err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return "", fmt.Errorf("read Duffel place lookup: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("Duffel place lookup returned %s: %s", response.Status, compactResponse(responseBody))
+	}
+	var result duffelPlaceSuggestionsResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return "", fmt.Errorf("decode Duffel place lookup: %w", err)
+	}
+	for _, place := range result.Data {
+		if place.IATACode != "" {
+			return place.IATACode, nil
+		}
+	}
+	return "", fmt.Errorf("Duffel found no airport or city for %q", value)
 }
 
 func makePassengers(count int) []duffelPassenger {
@@ -208,18 +608,42 @@ func mapDuffelOffer(offer duffelOffer) (FlightOffer, error) {
 	if airline == "" {
 		airline = first.MarketingCarrier.Name
 	}
-	return FlightOffer{
+	mapped := FlightOffer{
 		ID:        offer.ID,
 		Airline:   airline,
 		FlightNum: first.MarketingCarrierFlightNumber,
-		Origin:    first.DepartingAirport.IATACode,
-		Dest:      last.ArrivingAirport.IATACode,
+		Origin:    segmentOriginCode(first),
+		Dest:      segmentDestinationCode(last),
 		DepTime:   first.DepartingAt,
 		ArrTime:   last.ArrivingAt,
 		Duration:  slice.Duration,
 		PriceINR:  priceINR,
 		Stops:     len(slice.Segments) - 1,
-	}, nil
+	}
+	if len(slice.Segments) > 1 {
+		for index := 0; index+1 < len(slice.Segments); index++ {
+			connection := slice.Segments[index]
+			next := slice.Segments[index+1]
+			airport := connection.ArrivingAirport.IATACode
+			if airport == "" {
+				airport = next.DepartingAirport.IATACode
+			}
+			if airport != "" {
+				mapped.ConnectionAirports = append(mapped.ConnectionAirports, airport)
+				if mapped.ConnectionAirport == "" {
+					mapped.ConnectionAirport = airport
+				}
+			}
+			if index == 0 {
+				arrivedAt, arrivalErr := time.Parse(time.RFC3339, connection.ArrivingAt)
+				departedAt, departureErr := time.Parse(time.RFC3339, next.DepartingAt)
+				if arrivalErr == nil && departureErr == nil {
+					mapped.LayoverHours = departedAt.Sub(arrivedAt).Hours()
+				}
+			}
+		}
+	}
+	return mapped, nil
 }
 
 func convertToINR(amount float64, currency string) (float64, error) {
@@ -360,7 +784,7 @@ func modelName() string {
 	if model := os.Getenv("GEMINI_MODEL"); model != "" {
 		return model
 	}
-	return "gemini-3.6-flash"
+	return "gemini-3.5-flash-lite"
 }
 
 func main() {

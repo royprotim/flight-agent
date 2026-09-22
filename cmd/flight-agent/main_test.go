@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +74,27 @@ func TestMapDuffelOffer(t *testing.T) {
 	}
 }
 
+func TestMapDuffelOfferUsesOriginAndDestinationFields(t *testing.T) {
+	offer := duffelOffer{
+		ID: "offer_places", TotalAmount: "100", TotalCurrency: "INR",
+		Slices: []duffelSlice{{Segments: []duffelSegment{{
+			Origin: struct {
+				IATACode string `json:"iata_code"`
+			}{IATACode: "DEL"},
+			Destination: struct {
+				IATACode string `json:"iata_code"`
+			}{IATACode: "IXZ"},
+		}}}},
+	}
+	mapped, err := mapDuffelOffer(offer)
+	if err != nil {
+		t.Fatalf("mapDuffelOffer returned error: %v", err)
+	}
+	if mapped.Origin != "DEL" || mapped.Dest != "IXZ" {
+		t.Fatalf("route = %s -> %s, want DEL -> IXZ", mapped.Origin, mapped.Dest)
+	}
+}
+
 func TestMapDuffelOfferRejectsInvalidOffer(t *testing.T) {
 	_, err := mapDuffelOffer(duffelOffer{ID: "off_empty", TotalAmount: "10", TotalCurrency: "INR"})
 	if err == nil || !strings.Contains(err.Error(), "no segments") {
@@ -115,8 +137,157 @@ func TestCompactResponse(t *testing.T) {
 	}
 }
 
+func TestBuildFlightQueryIncludesArbitraryPreference(t *testing.T) {
+	query := BuildFlightQuery(FlightSearchParams{
+		Origin:        " Delhi ",
+		Destination:   "Port Blair",
+		DepartureDate: "2026-12-19",
+		Passengers:    1,
+		CabinClass:    "ECONOMY",
+		Preference:    "I need extra legroom and would like a vegetarian meal.",
+	})
+
+	want := "Find a economy flight for 1 passenger(s) from DELHI to PORT BLAIR on 2026-12-19. User preference: I need extra legroom and would like a vegetarian meal."
+	if query != want {
+		t.Fatalf("query = %q, want %q", query, want)
+	}
+}
+
+func TestBuildFlightQueryAllowsEmptyPreference(t *testing.T) {
+	query := BuildFlightQuery(FlightSearchParams{
+		Origin:        "DEL",
+		Destination:   "IXZ",
+		DepartureDate: "2026-12-19",
+		Passengers:    2,
+		CabinClass:    "BUSINESS",
+	})
+	if strings.Contains(query, "User preference:") {
+		t.Fatalf("query unexpectedly contains an empty preference: %q", query)
+	}
+}
+
+func TestResolveAirportCode(t *testing.T) {
+	got, err := resolveAirportCode(context.Background(), "", " ixz ")
+	if err != nil {
+		t.Fatalf("resolveAirportCode returned error: %v", err)
+	}
+	if got != "IXZ" {
+		t.Fatalf("resolveAirportCode = %q, want IXZ", got)
+	}
+}
+
+func TestResolveAirportCodeRejectsUnknownLocation(t *testing.T) {
+	if _, err := resolveAirportCode(context.Background(), "", ""); err == nil {
+		t.Fatal("expected empty location error")
+	}
+}
+
+func TestParseLayoverPreference(t *testing.T) {
+	layover, ok := parseLayoverPreference("I need a layover of 4 hrs in Kolkata")
+	if !ok {
+		t.Fatal("expected layover preference to be parsed")
+	}
+	if layover.airport != "CCU" || layover.hours != 4 {
+		t.Fatalf("parsed layover = %+v, want CCU and 4 hours", layover)
+	}
+}
+
+func TestParseLayoverPreferenceAllowsUnspecifiedDuration(t *testing.T) {
+	layover, ok := parseLayoverPreference("Need a layover in Kolkata")
+	if !ok || layover.airport != "CCU" || layover.hours != 0 {
+		t.Fatalf("parsed layover = %+v, ok=%v; want CCU with unspecified duration", layover, ok)
+	}
+}
+
+func TestBuildLayoverExplanation(t *testing.T) {
+	layover := layoverPreference{airport: "CCU", hours: 4}
+	explanation := buildLayoverExplanation([]duffelOffer{
+		{Slices: []duffelSlice{{Segments: []duffelSegment{
+			{ArrivingAt: "2026-12-19T15:10:00Z", ArrivingAirport: struct {
+				IATACode string `json:"iata_code"`
+			}{IATACode: "CCU"}},
+			{DepartingAt: "2026-12-19T13:56:00Z", DepartingAirport: struct {
+				IATACode string `json:"iata_code"`
+			}{IATACode: "CCU"}},
+		}}}}}, layover, "DEL", "IXZ")
+
+	if !strings.Contains(explanation.Title, "4-hour layover") || !strings.Contains(explanation.Reason, "DEL to IXZ") {
+		t.Fatalf("unexpected explanation: %+v", explanation)
+	}
+}
+
+func TestBuildLayoverExplanationWithoutDuration(t *testing.T) {
+	explanation := buildLayoverExplanation(nil, layoverPreference{airport: "CCU"}, "DEL", "IXZ")
+	if explanation.Title != "No flight combinations include a connection in CCU" {
+		t.Fatalf("title = %q", explanation.Title)
+	}
+	if strings.Contains(explanation.Title, "0-hour") {
+		t.Fatalf("title incorrectly contains zero-hour duration: %q", explanation.Title)
+	}
+}
+
+func TestFilterLayoverOffersAllowsAnyDurationWhenUnspecified(t *testing.T) {
+	offer := duffelOffer{ID: "via-ccu", Slices: []duffelSlice{{Segments: []duffelSegment{
+		{ArrivingAirport: struct {
+			IATACode string `json:"iata_code"`
+		}{IATACode: "CCU"}, ArrivingAt: "2026-10-25T08:00:00Z"},
+		{DepartingAirport: struct {
+			IATACode string `json:"iata_code"`
+		}{IATACode: "CCU"}, DepartingAt: "2026-10-25T15:00:00Z"},
+	}}}}
+
+	filtered := filterLayoverOffers([]duffelOffer{offer}, layoverPreference{airport: "CCU"})
+	if len(filtered) != 1 || filtered[0].ID != "via-ccu" {
+		t.Fatalf("filtered offers = %+v, want the CCU connection regardless of duration", filtered)
+	}
+}
+
+func TestSortOffersByPreferredAirlines(t *testing.T) {
+	offers := []FlightOffer{
+		{ID: "air-india", Airline: "Air India"},
+		{ID: "other", Airline: "Other Airways"},
+		{ID: "indigo", Airline: "IndiGo"},
+	}
+	sortOffersByPreferredAirlines(offers, []string{"IndiGo", "Air India"})
+	if offers[0].ID != "indigo" || offers[1].ID != "air-india" || offers[2].ID != "other" {
+		t.Fatalf("sorted offers = %+v", offers)
+	}
+}
+
+func TestPersonalizeOffersMarksAndRanksPreferredFlights(t *testing.T) {
+	offers := []FlightOffer{
+		{ID: "other", Airline: "Other Airways", PriceINR: 5000, Stops: 1},
+		{ID: "preferred", Airline: "IndiGo", PriceINR: 7000, Stops: 0},
+	}
+	personalizeOffers(offers, UserProfile{PreferredAirlines: []string{"IndiGo"}, BudgetVsComfort: "budget", AverageBookingPriceINR: 8000})
+	if offers[0].ID != "preferred" || !offers[0].Recommended {
+		t.Fatalf("personalized offers = %+v", offers)
+	}
+	if len(offers[0].PreferenceReasons) == 0 {
+		t.Fatal("expected recommendation reasons")
+	}
+}
+
+func TestRateOfferUsesPriceAndMarksUnavailableReliability(t *testing.T) {
+	rating := rateOffer(FlightOffer{PriceINR: 5000, Stops: 0}, UserProfile{AverageBookingPriceINR: 10000})
+	if rating.Overall <= 0 || rating.PriceSensitivity != 50 {
+		t.Fatalf("rating = %+v, want neutral single-offer price score and positive overall score", rating)
+	}
+	if rating.Delay != 50 || rating.ReliabilityAvailable {
+		t.Fatalf("rating delay/reliability = %+v", rating)
+	}
+	if len(rating.Reasons) == 0 {
+		t.Fatal("expected rating reasons")
+	}
+}
+
 func TestSampleBookingProfiles(t *testing.T) {
 	store := NewInMemoryBookingStore()
+	for _, userID := range []string{"user_001", "user_002", "user_003", "user_004"} {
+		if count := len(store.RecentBookings(userID, 0)); count < 10 {
+			t.Fatalf("%s has %d sample bookings, want at least 10", userID, count)
+		}
+	}
 
 	tests := []struct {
 		userID    string
